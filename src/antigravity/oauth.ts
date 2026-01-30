@@ -1,0 +1,285 @@
+import { createHash, randomBytes } from "node:crypto";
+
+import {
+  ANTIGRAVITY_CLIENT_ID,
+  ANTIGRAVITY_CLIENT_SECRET,
+  ANTIGRAVITY_REDIRECT_URI,
+  ANTIGRAVITY_SCOPES,
+  CODE_ASSIST_ENDPOINT_FALLBACKS,
+  CODE_ASSIST_HEADERS,
+} from "../constants";
+
+interface PkcePair {
+  challenge: string;
+  verifier: string;
+}
+
+interface AntigravityAuthState {
+  verifier: string;
+  projectId: string;
+}
+
+export interface AntigravityAuthorization {
+  url: string;
+  verifier: string;
+  projectId: string;
+}
+
+interface AntigravityTokenExchangeSuccess {
+  type: "success";
+  refresh: string;
+  access: string;
+  expires: number;
+  email?: string;
+  projectId: string;
+  tier?: "free" | "paid";
+}
+
+interface AntigravityTokenExchangeFailure {
+  type: "failed";
+  error: string;
+}
+
+export type AntigravityTokenExchangeResult =
+  | AntigravityTokenExchangeSuccess
+  | AntigravityTokenExchangeFailure;
+
+interface AntigravityTokenResponse {
+  access_token: string;
+  expires_in: number;
+  refresh_token: string;
+}
+
+interface AntigravityUserInfo {
+  email?: string;
+}
+
+function base64UrlEncode(buffer: Buffer): string {
+  return buffer
+    .toString("base64")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/g, "");
+}
+
+function generatePKCE(): PkcePair {
+  const verifier = base64UrlEncode(randomBytes(32));
+  const challenge = base64UrlEncode(createHash("sha256").update(verifier).digest());
+  return { verifier, challenge };
+}
+
+function encodeState(payload: AntigravityAuthState): string {
+  return Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
+}
+
+function decodeState(state: string): AntigravityAuthState {
+  const normalized = state.replace(/-/g, "+").replace(/_/g, "/");
+  const padded = normalized.padEnd(normalized.length + ((4 - normalized.length % 4) % 4), "=");
+  const json = Buffer.from(padded, "base64").toString("utf8");
+  const parsed = JSON.parse(json);
+  if (typeof parsed.verifier !== "string") {
+    throw new Error("Missing PKCE verifier in state");
+  }
+  return {
+    verifier: parsed.verifier,
+    projectId: typeof parsed.projectId === "string" ? parsed.projectId : "",
+  };
+}
+
+/**
+ * Automatically discover project ID and account tier from Antigravity API.
+ * Tries multiple endpoints to find the user's default project and tier.
+ */
+export async function fetchAccountInfo(accessToken: string): Promise<{ projectId: string; tier: "free" | "paid" }> {
+  const errors: string[] = [];
+  let detectedTier: "free" | "paid" = "free";
+
+  const loadHeaders: Record<string, string> = {
+    Authorization: `Bearer ${accessToken}`,
+    "Content-Type": "application/json",
+    ...CODE_ASSIST_HEADERS,
+  };
+
+  for (const baseEndpoint of CODE_ASSIST_ENDPOINT_FALLBACKS) {
+    try {
+      const url = `${baseEndpoint}/v1internal:loadCodeAssist`;
+      const response = await fetch(url, {
+        method: "POST",
+        headers: loadHeaders,
+        body: JSON.stringify({
+          metadata: {
+            ideType: "IDE_UNSPECIFIED",
+            platform: "PLATFORM_UNSPECIFIED",
+            pluginType: "GEMINI",
+          },
+        }),
+      });
+
+      if (!response.ok) {
+        const message = await response.text().catch(() => "");
+        errors.push(
+          `loadCodeAssist ${response.status} at ${baseEndpoint}${message ? `: ${message}` : ""
+          }`,
+        );
+        continue;
+      }
+
+      const data = await response.json();
+      let projectId = "";
+
+      // Extract Project ID
+      if (typeof data.cloudaicompanionProject === "string" && data.cloudaicompanionProject) {
+        projectId = data.cloudaicompanionProject;
+      } else if (
+        data.cloudaicompanionProject &&
+        typeof data.cloudaicompanionProject.id === "string" &&
+        data.cloudaicompanionProject.id
+      ) {
+        projectId = data.cloudaicompanionProject.id;
+      }
+
+      if (Array.isArray(data.allowedTiers)) {
+        const defaultTier = data.allowedTiers.find((t: any) => t.isDefault);
+        if (defaultTier && typeof defaultTier.id === "string") {
+          const tierId = defaultTier.id;
+          if (tierId !== "legacy-tier" && !tierId.includes("free") && !tierId.includes("zero")) {
+            detectedTier = "paid";
+          } else if (tierId !== "legacy-tier") {
+            console.debug(`[antigravity] Detected free tier variant: ${tierId}`);
+          }
+        }
+      }
+
+      if (data.paidTier && typeof data.paidTier.id === "string") {
+        const paidTierId = data.paidTier.id;
+        if (!paidTierId.includes("free") && !paidTierId.includes("zero")) {
+          detectedTier = "paid";
+          console.debug(`[antigravity] Detected paid tier from paidTier field: ${paidTierId}`);
+        }
+      }
+
+      if (projectId) {
+        return { projectId, tier: detectedTier };
+      }
+
+      errors.push(`loadCodeAssist missing project id at ${baseEndpoint}`);
+    } catch (e) {
+      errors.push(
+        `loadCodeAssist error at ${baseEndpoint}: ${e instanceof Error ? e.message : String(e)
+        }`,
+      );
+    }
+  }
+
+  if (errors.length) {
+    console.warn("Failed to resolve Antigravity account info via loadCodeAssist:", errors.join("; "));
+  }
+  return { projectId: "", tier: detectedTier };
+}
+
+export async function authorizeAntigravity(projectId = ""): Promise<AntigravityAuthorization> {
+  const pkce = (await generatePKCE()) as PkcePair;
+
+  const url = new URL("https://accounts.google.com/o/oauth2/v2/auth");
+  url.searchParams.set("client_id", ANTIGRAVITY_CLIENT_ID);
+  url.searchParams.set("response_type", "code");
+  url.searchParams.set("redirect_uri", ANTIGRAVITY_REDIRECT_URI);
+  url.searchParams.set("scope", ANTIGRAVITY_SCOPES.join(" "));
+  url.searchParams.set("code_challenge", pkce.challenge);
+  url.searchParams.set("code_challenge_method", "S256");
+  url.searchParams.set(
+    "state",
+    encodeState({ verifier: pkce.verifier, projectId: projectId || "" }),
+  );
+  url.searchParams.set("access_type", "offline");
+  url.searchParams.set("prompt", "consent");
+
+  return {
+    url: url.toString(),
+    verifier: pkce.verifier,
+    projectId: projectId || "",
+  };
+}
+
+export async function exchangeAntigravity(
+  code: string,
+  state: string,
+): Promise<AntigravityTokenExchangeResult> {
+  try {
+    if (!ANTIGRAVITY_CLIENT_SECRET) {
+      return {
+        type: "failed",
+        error: "Missing ANTIGRAVITY_CLIENT_SECRET. Set it in your environment before authenticating.",
+      };
+    }
+
+    const { verifier, projectId } = decodeState(state);
+
+    const tokenResponse = await fetch("https://oauth2.googleapis.com/token", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body: new URLSearchParams({
+        client_id: ANTIGRAVITY_CLIENT_ID,
+        client_secret: ANTIGRAVITY_CLIENT_SECRET,
+        code,
+        grant_type: "authorization_code",
+        redirect_uri: ANTIGRAVITY_REDIRECT_URI,
+        code_verifier: verifier,
+      }),
+    });
+
+    if (!tokenResponse.ok) {
+      const errorText = await tokenResponse.text();
+      return { type: "failed", error: errorText };
+    }
+
+    const tokenPayload = (await tokenResponse.json()) as AntigravityTokenResponse;
+
+    const userInfoResponse = await fetch(
+      "https://www.googleapis.com/oauth2/v1/userinfo?alt=json",
+      {
+        headers: {
+          Authorization: `Bearer ${tokenPayload.access_token}`,
+        },
+      },
+    );
+
+    const userInfo = userInfoResponse.ok
+      ? ((await userInfoResponse.json()) as AntigravityUserInfo)
+      : {};
+
+    const refreshToken = tokenPayload.refresh_token;
+    if (!refreshToken) {
+      return { type: "failed", error: "Missing refresh token in response" };
+    }
+
+    // Auto-discover project ID and tier if not provided, or fetch tier if project ID is provided
+    let effectiveProjectId = projectId;
+
+    const accountInfo = await fetchAccountInfo(tokenPayload.access_token);
+    if (!effectiveProjectId) {
+      effectiveProjectId = accountInfo.projectId;
+    }
+    const tier = accountInfo.tier;
+
+    // Don't embed email in refresh token - we store it separately in accounts.json
+    const storedRefresh = `${refreshToken}|${effectiveProjectId || ""}`;
+
+    return {
+      type: "success",
+      refresh: storedRefresh,
+      access: tokenPayload.access_token,
+      expires: Date.now() + tokenPayload.expires_in * 1000,
+      email: userInfo.email,
+      projectId: effectiveProjectId || "",
+      tier,
+    };
+  } catch (error) {
+    return {
+      type: "failed",
+      error: error instanceof Error ? error.message : "Unknown error",
+    };
+  }
+}
